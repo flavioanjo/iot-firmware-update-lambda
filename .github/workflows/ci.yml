@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files need gofmt:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test (race detector)
+        run: go test -race -count=1 ./...
+
+      - name: Vet and build device simulator
+        working-directory: teste
+        run: |
+          go vet ./...
+          go build ./...
+
+      - name: Build Lambda binary (no deploy)
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: go build -trimpath -tags lambda.norpc -ldflags="-s -w" -o bootstrap .
+
+      - name: Ensure no build artifacts are tracked
+        run: |
+          if git ls-files | grep -E '(^|/)bootstrap$|\.zip$|\.exe$'; then
+            echo "Build artifacts must not be committed"; exit 1
+          fi

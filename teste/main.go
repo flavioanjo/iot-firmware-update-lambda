@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -14,7 +15,7 @@ import (
 )
 
 const (
-	urlLocal     = "http://localhost:8080/default/DownloadFirmware"
+	urlLocal     = "http://localhost:8080/default/DownloadIOTFirmware"
 	urlPrimary   = "https://iot-firmware.example.com/update"
 	urlSecondary = "https://iot-firmware.example.com/backup/update"
 	blockSize    = 1024
@@ -23,18 +24,20 @@ const (
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Usage: go run main.go <device_id> [block_size] [primary|secondary]")
+		fmt.Println("Usage: go run . <device_id> [block_size] [primary|secondary|<url>]")
 		fmt.Println("")
 		fmt.Println("  device_id    - Device identifier (required)")
 		fmt.Println("  block_size   - Firmware block size in bytes (optional, default 1024)")
 		fmt.Println("  primary      - Use the primary firmware server endpoint")
 		fmt.Println("  secondary    - Use the secondary firmware server endpoint")
+		fmt.Println("  <url>        - Use a custom endpoint (http:// or https://)")
 		fmt.Println("")
 		fmt.Println("Examples:")
-		fmt.Println("  go run main.go 12345                 (local, 1024-byte block)")
-		fmt.Println("  go run main.go 12345 2048            (local, 2048-byte block)")
-		fmt.Println("  go run main.go 12345 1024 primary   (primary firmware server, 1024-byte block)")
-		fmt.Println("  go run main.go 12345 1024 secondary (secondary firmware server, 1024-byte block)")
+		fmt.Println("  go run . 12345                 (local, 1024-byte block)")
+		fmt.Println("  go run . 12345 2048            (local, 2048-byte block)")
+		fmt.Println("  go run . 12345 1024 primary    (primary firmware server, 1024-byte block)")
+		fmt.Println("  go run . 12345 1024 secondary  (secondary firmware server, 1024-byte block)")
+		fmt.Println("  go run . 12345 1024 http://localhost:9090/default/DownloadIOTFirmware")
 		os.Exit(1)
 	}
 
@@ -42,10 +45,13 @@ func main() {
 
 	// The block size can be passed as the second argument (optional)
 	bloco := blockSize
-	if len(os.Args) >= 3 {
-		if val, err := strconv.Atoi(os.Args[2]); err == nil {
-			bloco = val
+	if len(os.Args) >= 3 && !strings.Contains(os.Args[2], "://") && os.Args[2] != "primary" && os.Args[2] != "secondary" {
+		val, err := strconv.Atoi(os.Args[2])
+		if err != nil || val <= 0 {
+			fmt.Printf("Invalid block size %q: must be a positive integer\n", os.Args[2])
+			os.Exit(1)
 		}
+		bloco = val
 	}
 
 	// Select the endpoint: local, primary, or secondary
@@ -57,6 +63,10 @@ func main() {
 		}
 		if arg == "secondary" {
 			baseURL = urlSecondary
+			break
+		}
+		if strings.HasPrefix(arg, "http://") || strings.HasPrefix(arg, "https://") {
+			baseURL = arg
 			break
 		}
 	}
@@ -97,7 +107,7 @@ func main() {
 	// ============================================================
 	fmt.Println("[Meta] Requesting firmware metadata (offset=-1)...")
 
-	urlMeta := fmt.Sprintf("%s?device_id=%s&offset=-1", baseURL, deviceID)
+	urlMeta := fmt.Sprintf("%s?device_id=%s&offset=-1", baseURL, url.QueryEscape(deviceID))
 	resp, err := client.Get(urlMeta)
 	if err != nil {
 		fmt.Printf("Firmware metadata request failed: %v\n", err)
@@ -151,12 +161,19 @@ func main() {
 	md5Hash := md5.New()
 
 	for {
-		url := fmt.Sprintf("%s?device_id=%s&offset=%d&block_size=%d", baseURL, deviceID, offset, bloco)
+		chunkURL := fmt.Sprintf("%s?device_id=%s&offset=%d&block_size=%d", baseURL, url.QueryEscape(deviceID), offset, bloco)
+
+		// Safety net: the server must answer with the EOF marker once offset
+		// reaches the firmware size, so never request more than one block past it.
+		if offset > tamanhoFirmware+bloco {
+			fmt.Println("\nServer did not signal end of file; aborting.")
+			os.Exit(1)
+		}
 
 		numRequisicoes++
 		fmt.Printf("[Req #%d] offset=%d, length=%d ... ", numRequisicoes, offset, bloco)
 
-		resp, err := client.Get(url)
+		resp, err := client.Get(chunkURL)
 		if err != nil {
 			fmt.Printf("\nFirmware request failed: %v\n", err)
 			os.Exit(1)
@@ -175,9 +192,12 @@ func main() {
 			os.Exit(1)
 		}
 
-		// Check whether the firmware transfer has reached the end (response starts with "*** MD5")
+		// The end of the transfer is a text/plain body starting with "*** MD5".
+		// Checking the content type avoids mistaking a binary chunk that
+		// happens to start with those bytes for the end marker.
 		bodyStr := string(body)
-		if strings.HasPrefix(bodyStr, "*** MD5") {
+		isText := strings.HasPrefix(resp.Header.Get("Content-Type"), "text/plain")
+		if isText && strings.HasPrefix(bodyStr, "*** MD5") {
 			fmt.Println("END!")
 			break
 		}
@@ -217,6 +237,9 @@ func main() {
 		fmt.Println("  Result:     Success - MD5 matches")
 	} else {
 		fmt.Println("  Result:     Error - MD5 mismatch")
+		fmt.Println("==================================================")
+		arquivo.Close()
+		os.Exit(1)
 	}
 	fmt.Println("==================================================")
 }
